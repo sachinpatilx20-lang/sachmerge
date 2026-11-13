@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Merge video and audio</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px system-ui, sans-serif; max-width: 420px; margin: 24px auto; padding: 0 16px; }
+  label { display: block; margin: 16px 0 4px; font-weight: 600; }
+  input, button { width: 100%; font: inherit; }
+  button { margin-top: 20px; padding: 12px; }
+  video { width: 100%; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <h1>Merge video and audio</h1>
+  <p>For WebM files. Works offline and takes a second.</p>
+
+  <label for="v">Video (.webm)</label>
+  <input type="file" id="v" accept=".webm,video/webm">
+
+  <label for="a">Audio (.webm)</label>
+  <input type="file" id="a" accept=".webm,audio/webm,video/webm">
+
+  <button id="go">Merge</button>
+  <p id="msg"></p>
+
+  <video id="out" controls playsinline hidden></video>
+  <a id="dl" download="merged.webm" hidden>Download merged.webm</a>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// MUX START: reads two WebM files and writes one, without re-encoding
+const te = new TextEncoder();
+
+function vint(b, p, keep) {
+  let n = 1, m = 0x80;
+  while (n <= 8 && !(b[p] & m)) { n++; m >>= 1; }
+  if (n > 8) throw new Error('This doesn’t look like a WebM file.');
+  let v = keep ? b[p] : b[p] & (m - 1), ones = (b[p] & (m - 1)) === m - 1;
+  for (let i = 1; i < n; i++) { v = v * 256 + b[p + i]; if (b[p + i] !== 255) ones = false; }
+  return [v, n, ones];
+}
+function head(b, p, end) {
+  if (p >= end) return null;
+  const [id, il] = vint(b, p, true);
+  if (p + il >= end) return null;
+  const [sz, sl, unk] = vint(b, p + il, false), ds = p + il + sl;
+  return {id, start: p, ds, de: unk ? end : Math.max(ds, Math.min(ds + sz, end)), unk};
+}
+const kids = (b, e) => { const a = []; let p = e.ds, k; while ((k = head(b, p, e.de))) { a.push(k); p = k.de; } return a; };
+const rd = (b, e) => { let v = 0; for (let i = e.ds; i < e.de; i++) v = v * 256 + b[i]; return v; };
+const val = (b, ks, id) => { const k = ks.find(k => k.id === id); return k ? rd(b, k) : 0; };
+
+const CLUSTER_KIDS = [0xE7, 0xA3, 0xA0, 0xA7, 0xAB, 0x5854, 0xAF, 0xEC, 0xBF];
+function block(b, s, e, base, extras, r) {
+  const [track, tl] = vint(b, s, false);
+  const rel = ((b[s + tl] << 8) | b[s + tl + 1]) << 16 >> 16, flags = b[s + tl + 2];
+  r.blocks.push({track, ticks: base + rel, flags, data: b.subarray(s + tl + 3, e), extras,
+    key: extras ? !extras.some(x => x[0] === 0xFB) : !!(flags & 0x80)});
+}
+function cluster(b, c, r) {
+  let p = c.ds, e, base = 0;
+  while ((e = head(b, p, c.de))) {
+    if (c.unk && !CLUSTER_KIDS.includes(e.id)) return p;
+    p = e.de;
+    if (e.id === 0xE7) base = rd(b, e);
+    else if (e.id === 0xA3) block(b, e.ds, e.de, base, null, r);
+    else if (e.id === 0xA0) {
+      const ks = kids(b, e), bl = ks.find(k => k.id === 0xA1);
+      if (bl) block(b, bl.ds, bl.de, base, ks.filter(k => k !== bl).map(k => b.subarray(k.start, k.de)), r);
+    }
+  }
+  return c.de;
+}
+function parse(b) {
+  if (!(b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3)) throw new Error('This doesn’t look like a WebM file.');
+  const r = {b, scale: 1e6, tracks: [], blocks: []};
+  let e, p = 0;
+  while ((e = head(b, p, b.length)) && e.id !== 0x18538067) p = e.de;
+  if (!e) throw new Error('No data found in the file.');
+  const end = e.de;
+  p = e.ds;
+  while ((e = head(b, p, end))) {
+    p = e.de;
+    if (e.id === 0x1549A966) { const s = kids(b, e).find(k => k.id === 0x2AD7B1); if (s) r.scale = rd(b, s); }
+    else if (e.id === 0x1654AE6B) kids(b, e).filter(t => t.id === 0xAE).forEach(t => {
+      const ks = kids(b, t); r.tracks.push({kids: ks, num: val(b, ks, 0xD7), type: val(b, ks, 0x83)});
+    });
+    else if (e.id === 0x1F43B675) p = cluster(b, e, r);
+  }
+  return r;
+}
+
+const idBytes = id => { const a = []; while (id > 0) { a.unshift(id % 256); id = Math.floor(id / 256); } return Uint8Array.from(a); };
+function sizeBytes(n) {
+  let l = 1; while (n >= Math.pow(128, l) - 1) l++;
+  const a = new Uint8Array(l);
+  for (let i = l - 1; i >= 0; i--) { a[i] = n % 256; n = Math.floor(n / 256); }
+  a[0] |= 0x80 >> (l - 1);
+  return a;
+}
+function el(id, ...parts) {
+  const f = parts.flat(Infinity); let n = 0;
+  for (const x of f) n += x.length;
+  return [idBytes(id), sizeBytes(n), ...f];
+}
+const wu = (id, v) => { const a = []; do { a.unshift(v % 256); v = Math.floor(v / 256); } while (v > 0); return el(id, Uint8Array.from(a)); };
+const wf = (id, v) => { const a = new Uint8Array(8); new DataView(a.buffer).setFloat64(0, v); return el(id, a); };
+const entry = (t, b, num) => el(0xAE, t.kids.map(k =>
+  k.id === 0xD7 ? wu(0xD7, num) : k.id === 0x73C5 ? wu(0x73C5, num + 1000) : b.subarray(k.start, k.de)));
+
+function mux(vb, ab) {
+  const V = parse(vb), A = parse(ab);
+  const vt = V.tracks.find(t => t.type === 1), at = A.tracks.find(t => t.type === 2);
+  if (!vt) throw new Error('The video file has no video track.');
+  if (!at) throw new Error('The audio file has no audio track.');
+  const vn = vt.num, an = vn + 1;
+  const pick = (P, num, to) => {
+    const a = P.blocks.filter(x => x.track === num).map(x => ({...x, track: to, t: Math.round(x.ticks * P.scale / 1e6)}));
+    const t0 = a.reduce((m, x) => Math.min(m, x.t), Infinity);
+    a.forEach(x => x.t -= t0);
+    return a;
+  };
+  const vbk = pick(V, vn, vn), abk = pick(A, at.num, an);
+  if (!vbk.length || !abk.length) throw new Error('One of the files has no audio or video data.');
+  const last = a => a.reduce((m, x) => Math.max(m, x.t), 0);
+  const end = Math.min(last(vbk), last(abk));   // stop where the shorter one ends
+  const all = [...vbk, ...abk].filter(x => x.t <= end).sort((x, y) => x.t - y.t || x.track - y.track);
+
+  const clusters = []; let c = null;
+  const close = () => c && clusters.push(el(0x1F43B675, wu(0xE7, c.t), c.items));
+  for (const x of all) {
+    if (!c || x.t - c.t > 30000 || (x.track === vn && x.key && x.t - c.t >= 2000)) { close(); c = {t: x.t, items: []}; }
+    const rel = x.t - c.t, hdr = Uint8Array.from([...sizeBytes(x.track), rel >> 8, rel & 255, x.flags]);
+    c.items.push(x.extras ? el(0xA0, el(0xA1, hdr, x.data), x.extras) : el(0xA3, hdr, x.data));
+  }
+  close();
+
+  const info = el(0x1549A966, wu(0x2AD7B1, 1e6), wf(0x4489, end), el(0x4D80, te.encode('merge')), el(0x5741, te.encode('merge')));
+  const tracks = el(0x1654AE6B, entry(vt, V.b, vn), entry(at, A.b, an));
+  const top = el(0x1A45DFA3, wu(0x4286, 1), wu(0x42F7, 1), wu(0x42F2, 4), wu(0x42F3, 8),
+    el(0x4282, te.encode('webm')), wu(0x4287, 4), wu(0x4285, 2));
+  return new Blob([...top, ...el(0x18538067, info, tracks, clusters)], {type: 'video/webm'});
+}
+// MUX END
+
+$('go').onclick = async () => {
+  const v = $('v').files[0], a = $('a').files[0];
+  if (!v || !a) { $('msg').textContent = 'Choose a video and an audio file.'; return; }
+  $('go').disabled = true; $('msg').textContent = 'Merging…';
+  try {
+    const blob = mux(new Uint8Array(await v.arrayBuffer()), new Uint8Array(await a.arrayBuffer()));
+    const url = URL.createObjectURL(blob);
+    $('out').src = url; $('out').hidden = false;
+    $('dl').href = url; $('dl').hidden = false;
+    $('msg').textContent = 'Done.';
+  } catch (e) {
+    $('msg').textContent = 'Failed: ' + e.message;
+  }
+  $('go').disabled = false;
+};
+</script>
+</body>
+</html>
